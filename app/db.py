@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join("data", "app.db"))
 
+
+class StaleSubmissionError(RuntimeError):
+    """合报保存时发现某区已换稿（请求的上报号不再是该区最新版本）。"""
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS registrations (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,9 +51,38 @@ CREATE TABLE IF NOT EXISTS diagnoses (
     result_json     TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+-- 甲乙分区上报：每次整份替换生成一个新版本（id 即上报号）
+CREATE TABLE IF NOT EXISTS zone_submissions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS zone_readings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    submission_id INTEGER NOT NULL REFERENCES zone_submissions(id),
+    segment_key   TEXT NOT NULL,
+    src           TEXT NOT NULL,
+    dst           TEXT NOT NULL,
+    meter_lo      INTEGER NOT NULL,
+    meter_hi      INTEGER NOT NULL
+);
+-- 成功合报：底表、诊断与所用两个上报号同一事务入库
+CREATE TABLE IF NOT EXISTS combined_reports (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    base_diagnosis_id INTEGER NOT NULL REFERENCES diagnoses(id),
+    base_shift        TEXT NOT NULL,
+    jia_submission_id INTEGER NOT NULL REFERENCES zone_submissions(id),
+    yi_submission_id  INTEGER NOT NULL REFERENCES zone_submissions(id),
+    boundary_json     TEXT NOT NULL,
+    inputs_json       TEXT NOT NULL,
+    result_json       TEXT NOT NULL,
+    created_at        TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_reg_shift  ON registrations(shift, id);
 CREATE INDEX IF NOT EXISTS idx_rem_shift  ON remeasurements(shift, id);
 CREATE INDEX IF NOT EXISTS idx_diag_shift ON diagnoses(shift, id);
+CREATE INDEX IF NOT EXISTS idx_zone_sub   ON zone_submissions(zone, id);
+CREATE INDEX IF NOT EXISTS idx_comb_base  ON combined_reports(base_diagnosis_id, id);
 """
 
 
@@ -164,3 +198,165 @@ def save_remeasures_with_diagnosis(shift: str, remeasures: list[dict],
             (shift, registration_id, json.dumps(inputs, ensure_ascii=False),
              json.dumps(result, ensure_ascii=False), _now()))
         return cur.lastrowid
+
+
+# ---------------- 分区上报（整份替换，版本即上报号） ----------------
+
+def save_zone_submission(zone: str, readings: list[dict]) -> int:
+    """整份保存一区读数并生成新版本，返回上报号（submission id）。"""
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO zone_submissions(zone, created_at) VALUES (?,?)",
+            (zone, _now()))
+        submission_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO zone_readings(submission_id, segment_key, src, dst, "
+            "meter_lo, meter_hi) VALUES (?,?,?,?,?,?)",
+            [(submission_id, r["segment_key"], r["from_node"], r["to_node"],
+              r["meter_lo"], r["meter_hi"]) for r in readings])
+        return submission_id
+
+
+def _load_submission(conn: sqlite3.Connection, submission_id: int) -> dict | None:
+    sub = conn.execute(
+        "SELECT id, zone, created_at FROM zone_submissions WHERE id=?",
+        (submission_id,)).fetchone()
+    if sub is None:
+        return None
+    rows = conn.execute(
+        "SELECT segment_key, src, dst, meter_lo, meter_hi "
+        "FROM zone_readings WHERE submission_id=? ORDER BY id",
+        (submission_id,)).fetchall()
+    return {"id": sub["id"], "zone": sub["zone"],
+            "created_at": sub["created_at"],
+            "readings": [dict(r) for r in rows]}
+
+
+def get_zone_submission(submission_id: int) -> dict | None:
+    with _conn() as conn:
+        return _load_submission(conn, submission_id)
+
+
+def latest_zone_submission_id(zone: str) -> int | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(id) AS m FROM zone_submissions WHERE zone=?",
+            (zone,)).fetchone()
+    return row["m"] if row and row["m"] is not None else None
+
+
+def latest_zone_submission(zone: str) -> dict | None:
+    sid = latest_zone_submission_id(zone)
+    if sid is None:
+        return None
+    with _conn() as conn:
+        return _load_submission(conn, sid)
+
+
+def list_zone_submissions(zone: str) -> list[dict]:
+    """该区全部上报版本（新的在前），逐条装载读数。"""
+    with _conn() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM zone_submissions WHERE zone=? ORDER BY id DESC",
+            (zone,)).fetchall()]
+    return [s for s in (get_zone_submission(i) for i in ids) if s]
+
+
+def get_diagnosis_by_id(diagnosis_id: int) -> dict | None:
+    with _conn() as conn:
+        r = conn.execute(
+            "SELECT id, shift, registration_id, inputs_json, result_json, "
+            "created_at FROM diagnoses WHERE id=?", (diagnosis_id,)).fetchone()
+    if r is None:
+        return None
+    return {"id": r["id"], "shift": r["shift"],
+            "registration_id": r["registration_id"],
+            "inputs": json.loads(r["inputs_json"]),
+            "result": json.loads(r["result_json"]),
+            "created_at": r["created_at"]}
+
+
+# ---------------- 合报 ----------------
+
+def save_combined_report(base_diagnosis_id: int, base_shift: str,
+                         jia_submission_id: int, yi_submission_id: int,
+                         boundary_keys: list[str], inputs: dict,
+                         result: dict) -> int:
+    """合报结果单事务入库，并在同一事务内复查两区是否已换稿。
+
+    任一区的最新上报号与请求指定的上报号不一致 -> StaleSubmissionError，
+    事务回滚，不写入任何合报记录（失败时原合报结果仍可查）。
+    """
+    with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for zone, wanted in (("甲", jia_submission_id),
+                                 ("乙", yi_submission_id)):
+                row = conn.execute(
+                    "SELECT MAX(id) AS m FROM zone_submissions WHERE zone=?",
+                    (zone,)).fetchone()
+                latest = row["m"] if row is not None else None
+                if latest != wanted:
+                    raise StaleSubmissionError(
+                        f"{zone}区已换稿：请求上报号 {wanted}，"
+                        f"当前最新上报号 {latest}")
+            cur = conn.execute(
+                "INSERT INTO combined_reports(base_diagnosis_id, base_shift, "
+                "jia_submission_id, yi_submission_id, boundary_json, "
+                "inputs_json, result_json, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (base_diagnosis_id, base_shift, jia_submission_id,
+                 yi_submission_id, json.dumps(boundary_keys, ensure_ascii=False),
+                 json.dumps(inputs, ensure_ascii=False),
+                 json.dumps(result, ensure_ascii=False), _now()))
+            report_id = cur.lastrowid
+        except Exception:
+            conn.rollback()
+            raise
+        conn.commit()
+        return report_id
+
+
+def _row_to_combined(r: sqlite3.Row) -> dict:
+    return {"id": r["id"],
+            "base_diagnosis_id": r["base_diagnosis_id"],
+            "base_shift": r["base_shift"],
+            "jia_submission_id": r["jia_submission_id"],
+            "yi_submission_id": r["yi_submission_id"],
+            "boundary_segment_keys": json.loads(r["boundary_json"]),
+            "inputs": json.loads(r["inputs_json"]),
+            "result": json.loads(r["result_json"]),
+            "created_at": r["created_at"]}
+
+
+_COMBINED_COLS = ("id, base_diagnosis_id, base_shift, jia_submission_id, "
+                  "yi_submission_id, boundary_json, inputs_json, result_json, "
+                  "created_at")
+
+
+def combined_reports_for_base(base_diagnosis_id: int) -> list[dict]:
+    """按底图（诊断号）查全部成功合报，新的在前。"""
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT {_COMBINED_COLS} FROM combined_reports "
+            "WHERE base_diagnosis_id=? ORDER BY id DESC",
+            (base_diagnosis_id,)).fetchall()
+    return [_row_to_combined(r) for r in rows]
+
+
+def latest_combined_report(base_diagnosis_id: int) -> dict | None:
+    """按底图查最近一次成功合报。"""
+    with _conn() as conn:
+        r = conn.execute(
+            f"SELECT {_COMBINED_COLS} FROM combined_reports "
+            "WHERE base_diagnosis_id=? ORDER BY id DESC LIMIT 1",
+            (base_diagnosis_id,)).fetchone()
+    return _row_to_combined(r) if r is not None else None
+
+
+def get_combined_report(report_id: int) -> dict | None:
+    with _conn() as conn:
+        r = conn.execute(
+            f"SELECT {_COMBINED_COLS} FROM combined_reports WHERE id=?",
+            (report_id,)).fetchone()
+    return _row_to_combined(r) if r is not None else None

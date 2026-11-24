@@ -7,6 +7,10 @@
   GET  /shifts/{shift}/diagnoses/latest  查询该班最新诊断
   GET  /shifts/{shift}/readings        查询该班当前登记与生效的复测区间
   GET  /shifts                         列出已有登记的班次
+
+分区合报接口见 app/zone_api.py（/zones/... 与 /combined-reports/...）：
+甲乙两区各自整份上报带符号读数，按既有诊断号选定管网底图拼表合报，
+交界管段取两区非负交集，其余管段一区独报；账不平也保存，换稿则退回。
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from . import db
 from .schemas import ReadingsIn, RemeasureBatch
 from .solver import Segment, SolverError, diagnose
+from .zone_api import router as zone_router
 
 
 @asynccontextmanager
@@ -32,9 +37,12 @@ app = FastAPI(
                 "除进出水口外各节点进出水量相等。账平则给出可行流量；"
                 "账不平则列出“仅忽略该表原读数即可账平”的水表及其管段可行水量上下界；"
                 "支持补登人工复测区间——复测值取代该表原读数，"
-                "与过水量上限一样始终有效。",
+                "与过水量上限一样始终有效。"
+                "另支持甲乙两区分区抄表与合报：按既有诊断号选定底图，"
+                "交界段取两区非负交集、其余段一区独报，保存时换稿即退回。",
     lifespan=lifespan,
 )
+app.include_router(zone_router)
 
 
 # ---------------- 内部工具 ----------------
